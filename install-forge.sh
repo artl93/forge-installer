@@ -4,18 +4,20 @@
 
 # Function to display usage
 show_usage() {
-    echo "Usage: $0 <forge_version> <target_directory> [mods_and_resource_directory] [saves_directory]"
+    echo "Usage: $0 <forge_version> <target_directory> [mods_and_resource_directory] [saves_directory] [owner_account]"
     echo ""
     echo "Parameters:"
     echo "  forge_version                 - Version of Forge to install (e.g., 1.20.1-47.4.4)"
     echo "  target_directory             - Directory where the server will be installed"
     echo "  mods_and_resource_directory  - Optional: Source directory containing mods and resourcepacks"
     echo "  saves_directory              - Optional: Source directory containing world saves"
+    echo "  owner_account                - Optional: User account to set as owner of server files"
     echo ""
     echo "Examples:"
     echo "  $0 1.20.1-47.4.4 /opt/minecraft-server"
     echo "  $0 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack"
     echo "  $0 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds"
+    echo "  $0 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds minecraft"
     exit 1
 }
 
@@ -68,11 +70,14 @@ else
     curl -L -o "$TEMP_INSTALLER_PATH" https://maven.minecraftforge.net/net/minecraftforge/forge/$FORGE_VERSION/forge-$FORGE_VERSION-installer.jar
 fi
 
+# Store current directory for later return
+ORIGINAL_DIR=$(pwd)
+
 # Change to target directory
-pushd "$TARGET_DIR"
+cd "$TARGET_DIR"
 
 # install the server to a directory
-java -jar "../$TEMP_INSTALLER_PATH" --installServer
+java -jar "$ORIGINAL_DIR/$TEMP_INSTALLER_PATH" --installServer
 
 # copy mods and resource packs (if source directory provided)
 if [ -n "$MODS_RESOURCE_DIR" ] && [ -d "$MODS_RESOURCE_DIR" ]; then
@@ -111,4 +116,13 @@ fi
 echo "eula=true" > "eula.txt"
 echo "EULA agreement created"
 
-popd
+if [ -z "$5" ]; then
+    echo "Warning: No owner account specified. Skipping chown."
+else
+    OWNER_ACCOUNT="$5"
+    sudo chown -R "$OWNER_ACCOUNT" *
+    echo "Changed ownership to $OWNER_ACCOUNT"
+fi
+
+# Return to original directory
+cd "$ORIGINAL_DIR"

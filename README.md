@@ -10,6 +10,7 @@ A shell script to automatically install and configure a Minecraft server using F
 - ⚡ **Efficient Downloads**: Caches downloaded installers to avoid re-downloading
 - 📋 **EULA Agreement**: Automatically agrees to Minecraft EULA
 - 🛡️ **Error Handling**: Comprehensive parameter validation and error checking
+- 👤 **Ownership Management**: Optional file ownership changes for server deployment
 
 ## Prerequisites
 
@@ -21,7 +22,7 @@ A shell script to automatically install and configure a Minecraft server using F
 ## Usage
 
 ```bash
-./setup.sh <forge_version> <target_directory> [mods_and_resource_directory] [saves_directory]
+./install-forge.sh <forge_version> <target_directory> [mods_and_resource_directory] [saves_directory] [owner_account]
 ```
 
 ### Parameters
@@ -32,22 +33,28 @@ A shell script to automatically install and configure a Minecraft server using F
 | `target_directory` | ✅ | Directory where the server will be installed |
 | `mods_and_resource_directory` | ❌ | Source directory containing `mods/` and `resourcepacks/` folders |
 | `saves_directory` | ❌ | Source directory containing world saves |
+| `owner_account` | ❌ | User account to set as owner of server files (requires sudo) |
 
 ### Examples
 
 #### Basic server installation:
 ```bash
-./setup.sh 1.20.1-47.4.4 /opt/minecraft-server
+./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server
 ```
 
 #### With mod pack:
 ```bash
-./setup.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack
+./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack
 ```
 
 #### With mod pack and custom world saves:
 ```bash
-./setup.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds
+./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds
+```
+
+#### With ownership change to minecraft user:
+```bash
+./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds minecraft
 ```
 
 ## Directory Structure
@@ -102,7 +109,8 @@ The script also creates a cache directory in the location where you run the scri
    - Copies mods and resource packs if source directory provided
    - Copies world saves from either dedicated saves directory or from mod pack directory
 6. **EULA Agreement**: Creates `eula.txt` with agreement to Minecraft EULA
-7. **Cleanup**: Returns to original directory
+7. **Ownership Management**: Optionally changes file ownership to specified user account
+8. **Cleanup**: Returns to original directory
 
 ## Caching
 
@@ -146,7 +154,7 @@ Adjust memory allocation (`-Xmx4G -Xms2G`) based on your server's requirements a
 
 **"Permission denied" error:**
 ```bash
-chmod +x setup.sh
+chmod +x install-forge.sh
 ```
 
 **Java not found:**
