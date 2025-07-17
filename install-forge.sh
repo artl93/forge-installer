@@ -120,7 +120,7 @@ if [ -z "$5" ]; then
     echo "Warning: No owner account specified. Skipping chown."
 else
     OWNER_ACCOUNT="$5"
-    sudo chown -R "$OWNER_ACCOUNT" *
+    sudo chown -R "$OWNER_ACCOUNT" "$TARGET_DIR"
     echo "Changed ownership to $OWNER_ACCOUNT"
 fi
 
