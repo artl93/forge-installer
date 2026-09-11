@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# mc-archive -- take a consistent, restorable snapshot of an instance.
+#
+#   mc-archive <instance>        archive it (refuses if the server is running)
+#   mc-archive <instance> --force-stop   stop it first, then archive
+#
+# Writes /opt/minecraft/backups/<instance>-<UTC timestamp>.tar.zst and a
+# .sha256 beside it. The instance directory is left in place -- this is
+# insurance, not a move. Bringing the pack back is just `mc-switch to <it>`.
+#
+# Refuses to archive a running server on purpose: tarring a live world gives
+# you an archive with half-written region files, which looks fine until the
+# day you actually need it.
+
+set -euo pipefail
+
+ROOT="${MC_ROOT:-/opt/minecraft}"
+BACKUPS="$ROOT/backups"
+UNIT_PREFIX=minecraft@
+
+die() { echo "error: $*" >&2; exit 1; }
+
+inst=${1:-}
+[[ -n "$inst" ]] || die "usage: mc-archive <instance> [--force-stop]"
+[[ -d "$ROOT/$inst" ]] || die "no such instance: $ROOT/$inst"
+
+unit="${UNIT_PREFIX}${inst}"
+if [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" == active ]]; then
+    if [[ "${2:-}" == "--force-stop" ]]; then
+        echo "stopping $inst first (waiting for world save)..."
+        systemctl stop "$unit"
+    else
+        die "$inst is running. Stop it first (sudo mc-switch stop) or pass --force-stop.
+     Archiving a live world captures partially-written region files."
+    fi
+fi
+
+mkdir -p "$BACKUPS"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+out="$BACKUPS/${inst}-${stamp}.tar.zst"
+
+compressor=(zstd -T0 -3)
+command -v zstd >/dev/null || { compressor=(gzip); out="${out%.zst}.gz"; }
+
+echo "archiving $ROOT/$inst -> $out"
+tar --use-compress-program="${compressor[*]}" \
+    -cf "$out" -C "$ROOT" "$inst"
+
+sha256sum "$out" > "$out.sha256"
+
+echo
+echo "archive:  $out"
+echo "size:     $(du -h "$out" | cut -f1)"
+echo "checksum: $(cut -d' ' -f1 "$out.sha256")"
+echo
+echo "restore with:"
+echo "  sudo tar -xf $out -C $ROOT"

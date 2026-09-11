@@ -1,0 +1,75 @@
+# modIds proven client-only by boot-testing real 1.20.1 Forge packs.
+#
+# Keyed by modId, not filename, so it survives version bumps.
+# This list is the accumulated result of boot-testing real packs. Add to it
+# whenever a boot test proves a mod is client-side; that is what makes the
+# next pack cheaper than the last.
+#
+# A mod belongs here only if the SERVER does not need it. When in doubt leave
+# it out -- the boot test will drop it and tell you, which is cheaper than
+# wrongly dropping something the server needed.
+
+# --- rendering / shaders / GPU
+badoptimizations
+bettergrass
+culllessleaves
+distanthorizons
+embeddium
+rubidium
+entityculling
+gpu_tape
+immediatelyfast
+immersive_optimization
+oculus
+puffish_biome_dither
+smoothchunk
+sodiumdynamiclights
+sodiumextras
+sodiumoptionsapi
+stellarcreateoptimization
+
+# --- HUD / GUI / input
+betterf3
+betterfpsdist
+clientcrafting
+highlight
+inventoryprofilesnext
+keymap
+libipn
+mindfuldarkness
+minecraft_cursor
+mousetweaks
+overflowingbars
+resourcepackoverrides
+smoothgui
+travelerstitles
+
+# --- recipe viewers' client-side helpers (JEI/EMI proper stay server-side)
+jei_plus_plus
+jeioptimizer
+nerb
+
+# --- animation / camera / movement feel
+cinematic_respawn
+dynamic_fps
+presencefootsteps
+seriousplayeranimations
+smoothmovement
+toofast
+particlerain
+
+# --- audio
+sound_physics_remastered
+
+# --- cosmetic / integration
+craftpresence
+unilib
+essential
+essentialtweaks
+chatanimation
+modelfix
+logbegone
+lazyyyyy
+
+# --- proven crash-on-server (client class references in common setup)
+createenergycannons

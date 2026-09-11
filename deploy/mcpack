@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+#
+# mcpack -- any modpack -> a verified, running dedicated server.
+#
+#   mcpack build  <source> <out> [--heap 10G] [--no-boot-test]
+#   mcpack deploy <build>  --host user@host --name <instance> [--update]
+#   mcpack all    <source> --host user@host --name <instance> [--heap 10G]
+#
+# SOURCE may be an installed CurseForge/Prism/MultiMC instance directory, a
+# .zip of one, or a Modrinth .mrpack. Forge, NeoForge and Fabric packs are all
+# handled; the server runtime is installed from the loader's own maven, so no
+# pre-existing server build is required.
+#
+#   --heap 10G          server heap                              [8G]
+#   --root DIR          where instances live on the server   [/opt/minecraft]
+#   --user NAME         account the server runs as               [minecraft]
+#   --cf-key KEY        CurseForge API key, for a manifest-only export
+#                       (or set CURSEFORGE_API_KEY). Not needed when you point
+#                       at an installed instance, or at a Modrinth .mrpack.
+#   --runtime-from DIR  reuse an identical runtime already on disk (offline)
+#   --no-boot-test      skip verification (NOT recommended)
+#   --port 25599        port for the local boot test            [25599]
+#   --update            deploying over an existing instance: keep its world,
+#                       server.properties, ops/whitelist/bans
+#   --run               execute the remote install over ssh -t (sudo prompts
+#                       you directly) instead of only staging it
+#
+# WHY A BOOT TEST IS PART OF THE PIPELINE, NOT AN EXTRA
+# -----------------------------------------------------
+# Forge mod metadata has no field naming which side a mod belongs on. So
+# "does the server need this?" cannot be read from a jar -- only decided,
+# then proven. Both kinds of error occur in real packs:
+#   * a mod that reads as client-only which the server hard-requires
+#     (sereneseasonsplus -> betterdays: dropping it aborts the load)
+#   * a mod that reads as server-safe which crashes during common setup
+#     (createenergycannons touches client particle classes)
+# The loop below boots the build, reads the failure, corrects the classifier
+# and rebuilds. That is the only reliable oracle.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILDER="$HERE/lib/mcbuild.py"
+KB="$HERE/lib/client-only-mods.txt"
+
+die()  { echo "error: $*" >&2; exit 1; }
+say()  { printf '\n=== %s ===\n' "$*"; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \?//'; exit "${1:-0}"; }
+
+CMD="${1:-}"; shift || true
+[[ -n "$CMD" ]] || usage 1
+case "$CMD" in -h|--help|help) usage 0 ;; esac
+
+SOURCE=""; OUT=""; HOST=""; NAME=""; HEAP="8G"; RUNTIME_FROM=""
+BOOT=1; PORT=25599; UPDATE=0; RUN=0; MAXIT=6; CF_KEY=""
+# Server-side layout. Defaults match the usual convention; override for hosts
+# that put instances elsewhere or run them as a different account.
+MC_ROOT="${MC_ROOT:-/opt/minecraft}"
+MC_USER="${MC_USER:-minecraft}"
+DROP_REASON=()      # parallel to DROP: why each was dropped
+pos=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --host) HOST="$2"; shift 2 ;;
+        --name) NAME="$2"; shift 2 ;;
+        --heap) HEAP="$2"; shift 2 ;;
+        --port) PORT="$2"; shift 2 ;;
+        --runtime-from) RUNTIME_FROM="$2"; shift 2 ;;
+        --cf-key) CF_KEY="$2"; shift 2 ;;
+        --root)   MC_ROOT="$2"; shift 2 ;;
+        --user)   MC_USER="$2"; shift 2 ;;
+        --no-boot-test) BOOT=0; shift ;;
+        --update) UPDATE=1; shift ;;
+        --run) RUN=1; shift ;;
+        -h|--help) usage 0 ;;
+        *) pos+=("$1"); shift ;;
+    esac
+done
+
+# --------------------------------------------------------------------- build
+KEEP=(); DROP=()
+do_build() {
+    local extra=()
+    for k in ${KEEP+"${KEEP[@]}"}; do extra+=(--keep "$k"); done
+    for d in ${DROP+"${DROP[@]}"}; do extra+=(--drop "$d"); done
+    python3 "$BUILDER" "$SOURCE" "$OUT" --heap "$HEAP" \
+        ${RUNTIME_FROM:+--runtime-from "$RUNTIME_FROM"} \
+        ${CF_KEY:+--cf-key "$CF_KEY"} ${extra+"${extra[@]}"}
+}
+
+# Record the build's contents before booting. A boot test makes the server
+# write world data, logs, caches and whatever directories its mods invent --
+# and no hardcoded list can cover every mod. So snapshot first, and afterwards
+# delete exactly what appeared. That keeps a test world from ever shipping.
+snapshot_tree() { ( cd "$OUT" && ls -A ) | sort > "$OUT/../.mcpack-pre-boot"; }
+
+# run.sh spawns java as a CHILD. Killing only the shell orphans the JVM: it
+# keeps the port, keeps running, and writes its test world back into the build
+# AFTER scrub has cleaned up. So give the boot test its own process group and
+# kill the whole group.
+boot_once() {
+    ( set -m
+      cd "$OUT"
+      rm -rf boottest logs crash-reports boot.log
+      cat > server.properties <<P
+online-mode=false
+level-name=boottest
+view-distance=4
+simulation-distance=4
+max-tick-time=-1
+server-port=$PORT
+P
+      sh run.sh > boot.log 2>&1 &
+      pid=$!
+      end=$((SECONDS + 1800))
+      while ! grep -qE 'Done \(|Failed to start|Crash report saved' boot.log 2>/dev/null; do
+          kill -0 $pid 2>/dev/null || break
+          (( SECONDS > end )) && { echo "  boot test timed out after 30m"; break; }
+          sleep 5
+      done
+      if kill -0 $pid 2>/dev/null; then
+          kill -TERM -- -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true
+          w=$((SECONDS + 120))
+          while kill -0 $pid 2>/dev/null && (( SECONDS < w )); do sleep 2; done
+          kill -KILL -- -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true
+      fi
+      wait $pid 2>/dev/null || true ) 2>/dev/null
+
+    # If anything still holds the test port, the world is still being written
+    # and no cleanup after this point can be trusted.
+    local holder deadline=$((SECONDS + 60))
+    while holder=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1); [[ -n "$holder" ]]; do
+        kill -KILL "$holder" 2>/dev/null || true
+        (( SECONDS > deadline )) && { echo "  WARNING: port $PORT still held by $holder"; break; }
+        sleep 1
+    done
+}
+
+scrub() {
+    local pre="$OUT/../.mcpack-pre-boot"
+    [[ -f "$pre" ]] || return 0
+    local entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        # never remove something the build itself produced
+        grep -qxF "$entry" "$pre" && continue
+        rm -rf "${OUT:?}/$entry"
+    done < <( cd "$OUT" && ls -A )
+    # server.properties is ours (written for the test), so it always goes
+    rm -f "$OUT/server.properties"
+    rm -f "$pre"
+}
+
+cmd_build() {
+    SOURCE="${pos[0]:-}"; OUT="${pos[1]:-}"
+    [[ -n "$SOURCE" && -n "$OUT" ]] || die "usage: mcpack build <source> <out> [opts]"
+    SOURCE="${SOURCE/#\~/$HOME}"; OUT="${OUT/#\~/$HOME}"
+
+    say "build"
+    do_build
+    (( BOOT )) || { echo; echo "Boot test skipped -- this build is UNVERIFIED."; return; }
+    [[ -f "$OUT/run.sh" ]] || die "no run.sh in $OUT"
+
+    snapshot_tree
+    local it prev_sig="" sig
+    for (( it=1; it<=MAXIT; it++ )); do
+        say "boot test (attempt $it)"
+        boot_once
+        if grep -q 'Done (' "$OUT/boot.log" 2>/dev/null; then
+            echo "  $(grep -o 'Done ([0-9.]*s)!' "$OUT/boot.log" | head -1)"
+            echo "  $(grep -oE 'Loading [0-9]+ mods' "$OUT/boot.log" | tail -1)"
+            break
+        fi
+        # Preserve the evidence: the next build wipes $OUT, boot.log included.
+        cp "$OUT/boot.log" "$OUT/../boot-attempt-$it.log" 2>/dev/null || true
+        echo "  failed -- reading why (log kept as boot-attempt-$it.log):"
+        local progress=0 mid req actual
+        # Forge reports two different problems in one block. Tell them apart by
+        # "Actual version": [MISSING] means the jar is absent; anything else
+        # means it is present but OUT OF RANGE, and re-adding the dependency is
+        # useless. Then it is the REQUESTER that cannot run in this pack.
+        while IFS=$'\t' read -r mid req actual; do
+            [[ -n "$mid" ]] || continue
+            if [[ "$actual" == "[MISSING]" ]]; then
+                echo "    '$mid' is absent (needed by '$req') -> forcing it back in"
+                KEEP+=("$mid"); progress=1
+            else
+                # already dropped for another unsatisfiable constraint?
+                local seen=0 d
+                for d in ${DROP+"${DROP[@]}"}; do [[ "$d" == "$req" ]] && seen=1; done
+                if (( ! seen )); then
+                    echo "    '$req' needs $mid outside this pack's version ($actual)"
+                    echo "      -> '$req' is incompatible with this pack; dropping it"
+                    DROP+=("$req")
+                    DROP_REASON+=("version-incompatible with this pack")
+                    progress=1
+                fi
+            fi
+        done < <(grep -oE "Mod ID: '[^']+', Requested by: '[^']+', Expected range: '[^']*', Actual version: '[^']*'" \
+                   "$OUT/boot.log" 2>/dev/null \
+                 | sed -E "s/Mod ID: '([^']+)', Requested by: '([^']+)', Expected range: '[^']*', Actual version: '([^']*)'/\1\t\2\t\3/" \
+                 | sort -u)
+        # a kept mod blew up during load
+        while read -r mid; do
+            [[ -n "$mid" ]] || continue
+            local skip=0 k d
+            for k in ${KEEP+"${KEEP[@]}"}; do [[ "$k" == "$mid" ]] && skip=1; done
+            for d in ${DROP+"${DROP[@]}"}; do [[ "$d" == "$mid" ]] && skip=1; done
+            (( skip )) && continue
+            echo "    mod '$mid' failed during load -> dropping it"
+            DROP+=("$mid"); DROP_REASON+=("crashed during load -- client-only"); progress=1
+        done < <(grep -oE 'Failed to create mod instance\. ModID: [A-Za-z0-9_-]+' "$OUT/boot.log" 2>/dev/null \
+                 | awk '{print $NF}' | sort -u)
+        if (( ! progress )); then
+            say "cannot proceed automatically"
+            echo "The boot failed for a reason this script does not recognise."
+            echo "The answer is nearly always in these lines:"; echo
+            grep -nE '\[FATAL\]|Caused by:|Missing or unsupported|requires' "$OUT/boot.log" | head -20
+            echo; echo "full log: $OUT/boot.log"
+            exit 1
+        fi
+        # If a correction round leaves the mod set byte-identical, looping again
+        # just repeats the same failure. Stop and hand it over.
+        sig=$( (cd "$OUT/mods" && printf '%s\n' *.jar) | sort | shasum | awk '{print $1}' )
+        if [[ -n "$prev_sig" && "$sig" == "$prev_sig" ]]; then
+            say "corrections are not changing the mod set"
+            echo "The same set failed twice; another attempt would fail identically."
+            echo "Last failure:"; echo
+            grep -A12 'Missing or unsupported mandatory dependencies' \
+                 "$OUT/../boot-attempt-$it.log" 2>/dev/null | head -14
+            exit 1
+        fi
+        prev_sig="$sig"
+        say "rebuilding with corrections"
+        do_build
+    done
+    grep -q 'Done (' "$OUT/boot.log" 2>/dev/null || die "still failing after $MAXIT attempts; see $OUT/boot.log"
+    scrub
+
+    say "verified"
+    echo "  build : $OUT"
+    echo "  mods  : $(ls "$OUT"/mods/*.jar | wc -l | tr -d ' ')  (boot-tested to Done)"
+    if [[ ${#KEEP[@]} -gt 0 || ${#DROP[@]} -gt 0 ]]; then
+        echo; echo "  the boot test corrected the static classification:"
+        local i k
+        for k in ${KEEP+"${KEEP[@]}"}; do echo "    keep  $k   (the server needs it)"; done
+        for (( i=0; i<${#DROP[@]}; i++ )); do
+            printf '    drop  %s   (%s)\n' "${DROP[$i]}" "${DROP_REASON[$i]:-unknown}"
+        done
+        # Only a load crash proves client-only. A version conflict is a pack
+        # problem and must NOT go in the knowledge base -- the same mod may be
+        # perfectly server-side in a pack that ships versions it accepts.
+        local kb_worthy=()
+        for (( i=0; i<${#DROP[@]}; i++ )); do
+            [[ "${DROP_REASON[$i]}" == *client-only* ]] && kb_worthy+=("${DROP[$i]}")
+        done
+        if [[ ${#kb_worthy[@]} -gt 0 ]]; then
+            echo; echo "  add these to $(basename "$KB"):"
+            for k in "${kb_worthy[@]}"; do echo "    $k"; done
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------- deploy
+# The remote half is generated rather than hand-written per pack, and is left
+# on the host so it can be read before it is run. It never touches an existing
+# minecraft@.service, and in --update mode it never touches live world state.
+cmd_deploy() {
+    local BUILD="${pos[0]:-}"
+    [[ -n "$BUILD" ]] || die "usage: mcpack deploy <build-dir> --host user@host --name <instance>"
+    BUILD="${BUILD/#\~/$HOME}"
+    [[ -d "$BUILD/mods" ]] || die "not a server build: $BUILD"
+    [[ -n "$HOST" ]] || die "--host is required"
+    [[ -n "$NAME" ]] || die "--name is required"
+    [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--name must be a plain instance name"
+    [[ -f "$BUILD/run.sh" ]] || die "$BUILD has no run.sh (built with --no-runtime?)"
+
+    # The build's own user_jvm_args.txt is the authority on heap -- a --heap
+    # passed to `deploy` (or its default) would otherwise disagree with what
+    # actually ships and mislead anyone reading the generated script.
+    local build_heap
+    build_heap=$(grep -m1 -oE '^-Xmx[0-9]+[MmGg]' "$BUILD/user_jvm_args.txt" 2>/dev/null | sed 's/^-Xmx//')
+    [[ -n "$build_heap" ]] && HEAP="$build_heap"
+
+    local STAGE="mcpack-staging/$NAME"
+    # Resolve the remote home NOW. The installer runs under sudo, where $HOME
+    # is /root, so a runtime $HOME would point at a directory that does not
+    # hold the staged build.
+    local REMOTE_HOME
+    REMOTE_HOME=$(ssh "$HOST" 'printf %s "$HOME"') || die "cannot reach $HOST"
+    [[ -n "$REMOTE_HOME" ]] || die "could not resolve the remote home directory"
+
+    say "upload to $HOST"
+    echo "  heap (from the build): $HEAP"
+    ssh "$HOST" "rm -rf ~/$STAGE && mkdir -p ~/$STAGE"
+    rsync -a --delete --exclude '_client_only' --exclude '_unloadable' \
+          --exclude 'boot.log' --exclude 'boottest' \
+          "$BUILD"/ "$HOST:~/$STAGE/"
+    echo "  uploaded $(du -sh "$BUILD" | cut -f1)"
+
+    local INSTALLER; INSTALLER=$(mktemp)
+    cat > "$INSTALLER" <<REMOTE
+#!/usr/bin/env bash
+# Generated by mcpack for instance '$NAME'. Safe to read before running.
+set -euo pipefail
+NAME=$NAME
+UPDATE=$UPDATE
+MC_USER=$MC_USER
+HEAP=$HEAP          # informational: the real value ships in user_jvm_args.txt
+STAGE=$REMOTE_HOME/$STAGE
+ROOT=$MC_ROOT
+DIR=\$ROOT/\$NAME
+UNIT=minecraft@\$NAME
+BACKUPS=\$ROOT/backups
+stamp=\$(date -u +%Y%m%dT%H%M%SZ)
+
+[[ \$EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+[[ -d \$STAGE/mods ]] || { echo "staging missing: \$STAGE" >&2; exit 1; }
+
+say() { printf '\n=== %s ===\n' "\$*"; }
+
+say "1. prerequisites"
+id "\$MC_USER" >/dev/null 2>&1 || { echo "  creating '\$MC_USER' account"; useradd -r -m -d "\$ROOT" -s /usr/sbin/nologin "\$MC_USER"; }
+command -v screen >/dev/null || { echo "ERROR: screen is not installed (apt install screen)" >&2; exit 1; }
+mkdir -p \$ROOT \$BACKUPS
+
+# Never modify an existing template -- other instances depend on its exact shape.
+if [[ -f /etc/systemd/system/minecraft@.service ]]; then
+    echo "  using the existing minecraft@.service template (unmodified)"
+else
+    echo "  creating /etc/systemd/system/minecraft@.service"
+    cat > /etc/systemd/system/minecraft@.service <<UNIT
+[Unit]
+Description=Minecraft server %i
+After=network.target
+
+[Service]
+User=\$MC_USER
+Group=\$MC_USER
+WorkingDirectory=\$ROOT/%i
+ExecStart=/usr/bin/screen -DmS mc-%i ./run.sh
+ExecStop=/usr/bin/screen -p 0 -S mc-%i -X eval 'stuff "say SERVER SHUTTING DOWN\\015"'
+ExecStop=/usr/bin/screen -p 0 -S mc-%i -X eval 'stuff "save-all\\015"'
+ExecStop=/usr/bin/screen -p 0 -S mc-%i -X eval 'stuff "stop\\015"'
+ExecStop=/bin/sh -c 'while pgrep -u minecraft -f "SCREEN.*mc-%i" >/dev/null; do sleep 2; done'
+Restart=on-failure
+SuccessExitStatus=0 1
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+fi
+
+say "2. stop \$NAME if running"
+if [[ "\$(systemctl is-active \$UNIT 2>/dev/null || true)" == active ]]; then
+    systemctl stop \$UNIT
+    for _ in \$(seq 1 90); do
+        [[ "\$(systemctl is-active \$UNIT 2>/dev/null || true)" == active ]] || break
+        sleep 2
+    done
+    [[ "\$(systemctl is-active \$UNIT 2>/dev/null || true)" == active ]] && { echo "did not stop; aborting" >&2; exit 1; }
+    echo "  stopped"
+else
+    echo "  not running"
+fi
+
+if [[ -d \$DIR ]]; then
+    say "3. snapshot the existing instance"
+    comp="zstd -T0 -3"; ext=zst; command -v zstd >/dev/null || { comp=gzip; ext=gz; }
+    snap=\$BACKUPS/\$NAME-pre-\$stamp.tar.\$ext
+    tar --use-compress-program="\$comp" -cf \$snap -C \$ROOT --exclude="\$NAME/libraries" \$NAME
+    echo "  \$snap (\$(du -h \$snap | cut -f1))"
+else
+    say "3. new instance -- nothing to snapshot"
+    snap="(none)"
+fi
+
+say "4. install"
+mkdir -p \$DIR
+if (( UPDATE )) && [[ -d \$DIR/world ]]; then
+    echo "  --update: keeping world/, server.properties, ops/whitelist/bans"
+    rsync -a --delete \$STAGE/mods/ \$DIR/mods/
+    rsync -a --exclude 'voicechat/' \$STAGE/config/ \$DIR/config/ 2>/dev/null || true
+    for d in kubejs defaultconfigs datapacks scripts; do
+        [[ -d \$STAGE/\$d ]] && rsync -a \$STAGE/\$d/ \$DIR/\$d/
+    done
+    rsync -a \$STAGE/libraries/ \$DIR/libraries/ 2>/dev/null || true
+    for f in run.sh user_jvm_args.txt eula.txt; do
+        [[ -f \$STAGE/\$f ]] && cp \$STAGE/\$f \$DIR/\$f
+    done
+else
+    # Fresh install: copy everything, but never clobber live state if present.
+    rsync -a --delete \\
+        --exclude 'world/' --exclude 'server.properties' --exclude 'ops.json' \\
+        --exclude 'whitelist.json' --exclude 'banned-*.json' --exclude 'usercache.json' \\
+        \$STAGE/ \$DIR/
+fi
+chmod +x \$DIR/run.sh
+chown -R "\$MC_USER:\$MC_USER" "\$DIR"
+
+say "5. enable + start"
+# One instance at a time: they share port 25565 and the box's RAM.
+for other in \$ROOT/*/; do
+    o=\$(basename "\$other"); [[ -f "\$other/run.sh" ]] || continue; [[ "\$o" == "\$NAME" ]] && continue
+    if [[ "\$(systemctl is-active minecraft@\$o 2>/dev/null || true)" == active ]]; then
+        echo "  stopping \$o (only one instance can bind 25565)"
+        systemctl stop minecraft@\$o
+    fi
+    systemctl disable minecraft@\$o >/dev/null 2>&1 || true
+done
+systemctl enable \$UNIT >/dev/null 2>&1
+systemctl start \$UNIT
+sleep 5
+systemctl is-active \$UNIT
+echo "  mods: \$(find \$DIR/mods -name '*.jar' | wc -l)   heap: \$(grep -m1 -oE '^-Xmx\\S+' \$DIR/user_jvm_args.txt)"
+
+say "done"
+cat <<SUM
+  instance : \$DIR
+  snapshot : \$snap
+  console  : sudo -u \$MC_USER screen -r mc-\$NAME    # Ctrl-A then D. Never Ctrl-C.
+  logs     : journalctl -u \$UNIT -f
+
+  A heavy pack needs several minutes to reach "Done". The port opens well
+  before the world is loaded, so the server list will say "still starting"
+  for a while -- that is normal.
+SUM
+REMOTE
+
+    scp -q "$INSTALLER" "$HOST:~/mcpack-install-$NAME.sh"
+    rm -f "$INSTALLER"
+    ssh "$HOST" "chmod +x ~/mcpack-install-$NAME.sh"
+
+    say "staged"
+    echo "  build  : ~/$STAGE on $HOST"
+    echo "  script : ~/mcpack-install-$NAME.sh  (read it first if you like)"
+    if (( RUN )); then
+        say "installing (sudo will prompt you)"
+        ssh -t "$HOST" "sudo bash ~/mcpack-install-$NAME.sh"
+    else
+        echo
+        echo "  run it:"
+        echo "      ssh $HOST"
+        echo "      sudo bash ~/mcpack-install-$NAME.sh"
+        echo
+        echo "  or re-run this with --run to do it over ssh now."
+    fi
+}
+
+case "$CMD" in
+    build)  cmd_build ;;
+    deploy) cmd_deploy ;;
+    all)
+        SOURCE="${pos[0]:-}"; [[ -n "$SOURCE" ]] || die "usage: mcpack all <source> --host H --name N"
+        [[ -n "$NAME" ]] || die "--name is required"
+        OUT="${OUT:-$HOME/Downloads/$NAME-ServerBuild}"
+        pos=("$SOURCE" "$OUT"); cmd_build
+        pos=("$OUT"); cmd_deploy ;;
+    *) die "unknown command '$CMD' (build | deploy | all)" ;;
+esac
