@@ -1,184 +1,116 @@
-# Minecraft Forge Server Installer
+# mcpack
 
-A shell script to automatically install and configure a Minecraft server using Forge with optional mod packs and world saves.
+Turn any Minecraft modpack into a verified, running dedicated server.
 
-## Features
-
-- 🚀 **Automated Forge Installation**: Downloads and installs any specified Forge version
-- 📦 **Mod Pack Support**: Automatically copies mods and resource packs from a source directory
-- 🌍 **World Save Management**: Copies world saves to the server
-- ⚡ **Efficient Downloads**: Caches downloaded installers to avoid re-downloading
-- 📋 **EULA Agreement**: Automatically agrees to Minecraft EULA
-- 🛡️ **Error Handling**: Comprehensive parameter validation and error checking
-- 👤 **Ownership Management**: Optional file ownership changes for server deployment
-
-## Prerequisites
-
-- Java 8 or higher installed
-- `curl` command available
-- Shell environment (bash/zsh/sh)
-- Internet connection for downloading Forge installer
-
-## Usage
-
-```bash
-./install-forge.sh <forge_version> <target_directory> [mods_and_resource_directory] [saves_directory] [owner_account]
+```
+mcpack build  <source> <out>   [--heap 10G] [--runtime-from DIR] [--cf-key KEY]
+mcpack deploy <build>  --host user@host --name <instance> [--update] [--run]
+mcpack all    <source> --host user@host --name <instance> [--heap 10G]
 ```
 
-### Parameters
+A modpack ships as a *client* pack. Making a server out of one means deciding
+which mods the server actually needs, resolving what those mods depend on,
+installing a matching server runtime, and proving the result boots. `mcpack`
+does all four.
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `forge_version` | ✅ | Version of Forge to install (e.g., `1.20.1-47.4.4`) |
-| `target_directory` | ✅ | Directory where the server will be installed |
-| `mods_and_resource_directory` | ❌ | Source directory containing `mods/` and `resourcepacks/` folders |
-| `saves_directory` | ❌ | Source directory containing world saves |
-| `owner_account` | ❌ | User account to set as owner of server files (requires sudo) |
+## Why this isn't a file copy
 
-### Examples
+**Forge mod metadata has no field saying which side a mod belongs on.**
+`displayTest` governs version handshakes, not sides, and a mod's own `[[mods]]`
+block has no `side` at all. So "does the server need this?" cannot be read out
+of a jar — only decided, and then proven by booting. Errors happen in both
+directions, and both are silent until they aren't:
 
-#### Basic server installation:
-```bash
-./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server
+* `sereneseasonsplus` hard-requires `betterdays`, which looks like a HUD mod.
+  Drop it and the server aborts at load.
+* `createenergycannons` looks server-safe but touches client-only particle
+  classes during common setup, and crashes the server.
+
+So `mcpack build` boots the build, reads the failure, corrects the
+classification and rebuilds — until it reaches `Done (...)!` or stops making
+progress. **A build that has not booted is not finished.**
+
+The loop distinguishes the two failures Forge reports in one block, by
+`Actual version`:
+
+| Forge says | meaning | correction |
+|---|---|---|
+| `Actual version: '[MISSING]'` | the jar is absent | restore it |
+| `Actual version: '6.0.8'` | present, out of range | the *requester* can't run here; drop it |
+
+## Sources
+
+| source | needs a key? |
+|---|---|
+| installed CurseForge / Prism / MultiMC instance | no |
+| Modrinth `.mrpack` | no |
+| CurseForge export **with** jars in `overrides/` | no |
+| CurseForge **manifest-only** export | yes — `--cf-key`, or `CURSEFORGE_API_KEY` |
+
+A CurseForge manifest lists mods as project/file ids only; resolving them needs
+a free key from <https://console.curseforge.com/>. CurseForge also lets authors
+forbid third-party distribution — for those files the API returns no download
+URL, and `mcpack` reports them by name rather than routing around the author's
+setting.
+
+Sources are never modified. When a step has to write into the pack (applying
+`overrides/`, downloading jars), `mcpack` copies it first.
+
+## Loaders
+
+Forge, NeoForge and Fabric. The server runtime is installed from the loader's
+own maven, so no pre-existing server build is needed. `--runtime-from DIR`
+reuses an identical runtime already on disk (faster, and works offline).
+
+## Deploying
+
+```
+mcpack deploy ./build --host me@box --name survival --update
 ```
 
-#### With mod pack:
-```bash
-./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack
-```
+Uploads the build, writes an installer to the host, and prints the command to
+run it. It is **not executed** unless you pass `--run`; read it first.
 
-#### With mod pack and custom world saves:
-```bash
-./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds
-```
+* Never modifies an existing `minecraft@.service` — other instances depend on
+  its exact shape. It is created only if absent.
+* Snapshots any existing instance before touching it.
+* `--update` preserves `world/`, `server.properties`, ops/whitelist/bans.
+  Without it, a fresh install still refuses to clobber those if present.
+* Stops and disables other instances first — they share port 25565.
+* `--root DIR` (default `/opt/minecraft`) and `--user NAME` (default
+  `minecraft`) for hosts with a different layout. `mc-switch` and `mc-archive`
+  read the same values from `MC_ROOT` / `MC_USER`, so set them to match if you
+  deployed under a non-default account.
 
-#### With ownership change to minecraft user:
-```bash
-./install-forge.sh 1.20.1-47.4.4 /opt/minecraft-server /home/user/modpack /home/user/worlds minecraft
-```
+## Layout
 
-## Directory Structure
+| path | role |
+|---|---|
+| `deploy/mcpack` | CLI: build → boot-test correction loop → deploy |
+| `deploy/lib/mcbuild.py` | source resolution, loader detect, runtime install, assemble |
+| `deploy/lib/packlib.py` | jar analysis: what a jar provides and demands |
+| `deploy/lib/client-only-mods.txt` | accumulated client-only modIds |
+| `deploy/mc-switch` | swap which instance runs and autostarts |
+| `deploy/mc-archive` | snapshot an instance |
+| `install-forge.sh` | standalone Forge installer (predates `mcpack`) |
 
-### Expected Source Structure
-If using the optional `mods_and_resource_directory`, it should be organized as:
-```
-mods_and_resource_directory/
-├── mods/
-│   ├── mod1.jar
-│   ├── mod2.jar
-│   └── ...
-├── resourcepacks/
-│   ├── pack1.zip
-│   ├── pack2.zip
-│   └── ...
-└── saves/ (optional, used if no separate saves_directory provided)
-    ├── world1/
-    ├── world2/
-    └── ...
-```
+`packlib` reads jar *contents*, never filenames — filenames lie. It resolves
+both nesting conventions (`META-INF/jarjar/` **and** `META-INF/jars/`),
+honours `side="CLIENT"` on dependencies, and recognises FML `LIBRARY` and
+ModLauncher service-provider jars that carry no `mods.toml`.
 
-### Generated Server Structure
-After running the script, your target directory will contain:
-```
-target_directory/
-├── forge-<version>.jar (main server jar)
-├── eula.txt (automatically agreed)
-├── libraries/ (Forge dependencies)
-├── mods/ (copied from source)
-├── resourcepacks/ (copied from source)
-└── world/ (world saves)
-```
+`client-only-mods.txt` is the accumulating asset: every boot-test correction
+belongs in it, and the tool prints exactly what to add. Classification is
+deliberately conservative — a mod is dropped only when that list names it,
+`--drop` names it, or it genuinely cannot load. Heuristic suspicions are
+printed as advice and never acted on, because a wrong drop fails in a much
+harder-to-read way than a wrong keep.
 
-### Cache Directory Structure
-The script also creates a cache directory in the location where you run the script:
-```
-./temp/
-└── forge-<version>-installer.jar (cached installers)
-```
+## Requirements
 
-## How It Works
-
-1. **Validation**: Checks all required parameters and validates input
-2. **Directory Setup**: Creates target directory if it doesn't exist
-3. **Download Management**: 
-   - Creates a `temp/` directory in the current working directory for caching installers
-   - Downloads Forge installer only if not already cached
-   - Reuses cached installers for faster subsequent runs
-4. **Server Installation**: Runs the Forge installer to set up the server
-5. **Content Copying**: 
-   - Copies mods and resource packs if source directory provided
-   - Copies world saves from either dedicated saves directory or from mod pack directory
-6. **EULA Agreement**: Creates `eula.txt` with agreement to Minecraft EULA
-7. **Ownership Management**: Optionally changes file ownership to specified user account
-8. **Cleanup**: Returns to original directory
-
-## Caching
-
-The script creates a `temp/` directory in the current working directory (where you run the script) to cache downloaded Forge installers. This means:
-
-- ✅ Faster subsequent installations of the same Forge version
-- ✅ Reduced bandwidth usage
-- ✅ Offline capability for previously downloaded versions
-- ℹ️ Cache is shared across all server installations from the same location
-- ℹ️ Manual cleanup required if you want to free up space
-
-To clear the cache:
-```bash
-rm -rf temp/
-```
-
-## Error Handling
-
-The script includes comprehensive error handling for:
-
-- Missing required parameters
-- Empty or invalid parameters
-- Missing source directories
-- Failed downloads
-- Missing subdirectories (with warnings)
-
-## Starting Your Server
-
-After installation, navigate to your target directory and start the server:
-
-```bash
-cd /path/to/your/server
-java -Xmx4G -Xms2G -jar forge-<version>.jar nogui
-```
-
-Adjust memory allocation (`-Xmx4G -Xms2G`) based on your server's requirements and available RAM.
-
-## Troubleshooting
-
-### Common Issues
-
-**"Permission denied" error:**
-```bash
-chmod +x install-forge.sh
-```
-
-**Java not found:**
-- Ensure Java 8+ is installed and in your PATH
-- On macOS: `brew install openjdk`
-- On Ubuntu/Debian: `sudo apt install openjdk-17-jdk`
-
-**Download fails:**
-- Check internet connection
-- Verify the Forge version exists at [Minecraft Forge Downloads](https://files.minecraftforge.net/)
-
-**Server won't start:**
-- Check Java version compatibility with Minecraft version
-- Ensure sufficient RAM allocation
-- Review server logs for specific errors
-
-## Contributing
-
-Feel free to submit issues and enhancement requests!
+Python 3.9+, Java (matching the pack's Minecraft version), `rsync`, `ssh`.
+Servers need `screen` and systemd.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-**Note**: This script automatically agrees to the [Minecraft EULA](https://aka.ms/MinecraftEULA) by creating `eula.txt` with `eula=true`. Make sure you agree with the EULA terms before using this script.
+See [LICENSE](LICENSE).

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# mc-switch -- swap which Minecraft instance runs and which starts at boot.
+#
+# Works with the minecraft@.service template that mcpack installs (or that
+# already exists on the host):
+#   ExecStart=/usr/bin/screen -DmS mc-%i ./run.sh   (WorkingDirectory $MC_ROOT/%i)
+# This script does not modify that unit. It only enables/disables/starts/stops
+# instances of it.
+#
+# The box has 15GB usable and each modded pack wants 5-10GB, and both bind
+# 25565, so exactly one instance may run at a time. Switching enforces that:
+# it stops and disables every other instance before starting the target.
+#
+#   mc-switch list             instances, which runs, which autostarts, heap
+#   mc-switch to <instance>    make <instance> the only running + autostarting one
+#   mc-switch stop             stop everything, disable autostart for everything
+#   mc-switch logs <instance>  follow journald output for that instance
+#   mc-switch console <inst>   attach to its screen session (Ctrl-A D to detach)
+#
+# Instances are directories under /opt/minecraft containing run.sh.
+
+set -euo pipefail
+
+ROOT="${MC_ROOT:-/opt/minecraft}"
+# Must match the account mcpack deployed under (mcpack --user / MC_USER).
+MC_USER="${MC_USER:-minecraft}"
+UNIT_PREFIX=minecraft@
+
+die() { echo "error: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "must run as root (use: sudo mc-switch $*)"; }
+
+instances() {
+    local d
+    for d in "$ROOT"/*/; do
+        [[ -f "${d}run.sh" ]] || continue
+        basename "$d"
+    done
+}
+
+valid_instance() {
+    local want=$1 i
+    while read -r i; do [[ "$i" == "$want" ]] && return 0; done < <(instances)
+    return 1
+}
+
+cmd_list() {
+    printf '%-26s %-10s %-12s %s\n' INSTANCE RUNNING AUTOSTART HEAP
+    local i unit running enabled heap
+    while read -r i; do
+        unit="${UNIT_PREFIX}${i}"
+        running=$(systemctl is-active  "$unit" 2>/dev/null || true)
+        enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+        heap=$(grep -hoE '^-Xmx[0-9]+[MmGg]' "$ROOT/$i/user_jvm_args.txt" 2>/dev/null | head -1)
+        printf '%-26s %-10s %-12s %s\n' \
+            "$i" "${running:-inactive}" "${enabled:-disabled}" "${heap:-unset}"
+    done < <(instances)
+    echo; free -h | sed -n '1,2p'
+}
+
+cmd_to() {
+    need_root to
+    local target=${1:-}
+    [[ -n "$target" ]] || die "usage: mc-switch to <instance>"
+    valid_instance "$target" || die "no such instance: $target (try: mc-switch list)"
+
+    # Stop and un-autostart everything else FIRST. Two packs cannot share 25565
+    # and cannot both fit in RAM, and two enabled units would race at boot.
+    local i unit
+    while read -r i; do
+        [[ "$i" == "$target" ]] && continue
+        unit="${UNIT_PREFIX}${i}"
+        if [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" == active ]]; then
+            echo "stopping $i (unit runs say/save-all/stop, then waits for the save)..."
+            systemctl stop "$unit"
+        fi
+        if [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" == enabled ]]; then
+            echo "disabling autostart for $i"
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+        fi
+    done < <(instances)
+
+    echo "enabling autostart for $target"
+    systemctl enable "${UNIT_PREFIX}${target}" >/dev/null 2>&1
+    echo "starting $target"
+    systemctl start  "${UNIT_PREFIX}${target}"
+    sleep 3
+    systemctl status "${UNIT_PREFIX}${target}" --no-pager -n 8 || true
+    echo
+    echo "a heavy pack takes 1-2 min to reach 'Done'. watch it:"
+    echo "  sudo mc-switch console $target     # live console, Ctrl-A then D to detach"
+}
+
+cmd_stop() {
+    need_root stop
+    local i unit
+    while read -r i; do
+        unit="${UNIT_PREFIX}${i}"
+        if [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" == active ]]; then
+            echo "stopping $i (waiting for world save)..."
+            systemctl stop "$unit"
+        fi
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+    done < <(instances)
+    echo "all instances stopped; nothing will autostart at boot."
+}
+
+cmd_logs() {
+    local t=${1:-}; [[ -n "$t" ]] || die "usage: mc-switch logs <instance>"
+    journalctl -u "${UNIT_PREFIX}${t}" -f -n 100
+}
+
+# The server runs as \$MC_USER inside screen, so attaching means
+# becoming that user. Ctrl-A then D detaches WITHOUT stopping the server;
+# never Ctrl-C in here, that kills the JVM without saving.
+cmd_console() {
+    need_root console
+    local t=${1:-}; [[ -n "$t" ]] || die "usage: mc-switch console <instance>"
+    valid_instance "$t" || die "no such instance: $t"
+    echo "attaching to mc-$t -- press Ctrl-A then D to detach. Do NOT press Ctrl-C."
+    sleep 1
+    exec sudo -u "$MC_USER" screen -r "mc-$t"
+}
+
+case "${1:-list}" in
+    list|ls|"")   cmd_list ;;
+    to|switch)    shift; cmd_to "$@" ;;
+    stop)         cmd_stop ;;
+    logs|log)     shift; cmd_logs "$@" ;;
+    console|rcon) shift; cmd_console "$@" ;;
+    *)            sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 1 ;;
+esac
