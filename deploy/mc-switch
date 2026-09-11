@@ -22,6 +22,8 @@
 set -euo pipefail
 
 ROOT="${MC_ROOT:-/opt/minecraft}"
+# Must match the account mcpack deployed under (mcpack --user / MC_USER).
+MC_USER="${MC_USER:-minecraft}"
 UNIT_PREFIX=minecraft@
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -107,7 +109,7 @@ cmd_logs() {
     journalctl -u "${UNIT_PREFIX}${t}" -f -n 100
 }
 
-# The server runs as the 'minecraft' user inside screen, so attaching means
+# The server runs as \$MC_USER inside screen, so attaching means
 # becoming that user. Ctrl-A then D detaches WITHOUT stopping the server;
 # never Ctrl-C in here, that kills the JVM without saving.
 cmd_console() {
@@ -116,7 +118,7 @@ cmd_console() {
     valid_instance "$t" || die "no such instance: $t"
     echo "attaching to mc-$t -- press Ctrl-A then D to detach. Do NOT press Ctrl-C."
     sleep 1
-    exec sudo -u minecraft screen -r "mc-$t"
+    exec sudo -u "$MC_USER" screen -r "mc-$t"
 }
 
 case "${1:-list}" in

@@ -78,7 +78,9 @@ run it. It is **not executed** unless you pass `--run`; read it first.
   Without it, a fresh install still refuses to clobber those if present.
 * Stops and disables other instances first — they share port 25565.
 * `--root DIR` (default `/opt/minecraft`) and `--user NAME` (default
-  `minecraft`) for hosts with a different layout.
+  `minecraft`) for hosts with a different layout. `mc-switch` and `mc-archive`
+  read the same values from `MC_ROOT` / `MC_USER`, so set them to match if you
+  deployed under a non-default account.
 
 ## Layout
 
