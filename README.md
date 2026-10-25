@@ -92,6 +92,7 @@ run it. It is **not executed** unless you pass `--run`; read it first.
 | `deploy/lib/client-only-mods.txt` | accumulated client-only modIds |
 | `deploy/mc-switch` | swap which instance runs and autostarts |
 | `deploy/mc-archive` | snapshot an instance |
+| `deploy/mc-watch` | follow a server's log from your machine over ssh |
 | `install-forge.sh` | standalone Forge installer (predates `mcpack`) |
 
 `packlib` reads jar *contents*, never filenames — filenames lie. It resolves

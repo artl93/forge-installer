@@ -17,7 +17,10 @@
 #   --cf-key KEY        CurseForge API key, for a manifest-only export
 #                       (or set CURSEFORGE_API_KEY). Not needed when you point
 #                       at an installed instance, or at a Modrinth .mrpack.
-#   --runtime-from DIR  reuse an identical runtime already on disk (offline)
+#   --runtime-from DIR  reuse an identical runtime already on disk (offline);
+#                       may be <out> itself, to rebuild in place
+#   --drop MODID        never deploy this mod (repeatable)
+#   --keep MODID        always deploy this mod, even if listed client-only
 #   --no-boot-test      skip verification (NOT recommended)
 #   --port 25599        port for the local boot test            [25599]
 #   --update            deploying over an existing instance: keep its world,
@@ -57,6 +60,7 @@ BOOT=1; PORT=25599; UPDATE=0; RUN=0; MAXIT=6; CF_KEY=""
 # that put instances elsewhere or run them as a different account.
 MC_ROOT="${MC_ROOT:-/opt/minecraft}"
 MC_USER="${MC_USER:-minecraft}"
+KEEP=(); DROP=()
 DROP_REASON=()      # parallel to DROP: why each was dropped
 pos=()
 while [[ $# -gt 0 ]]; do
@@ -69,6 +73,8 @@ while [[ $# -gt 0 ]]; do
         --cf-key) CF_KEY="$2"; shift 2 ;;
         --root)   MC_ROOT="$2"; shift 2 ;;
         --user)   MC_USER="$2"; shift 2 ;;
+        --keep)   KEEP+=("$2"); shift 2 ;;
+        --drop)   DROP+=("$2"); DROP_REASON+=("named by --drop"); shift 2 ;;
         --no-boot-test) BOOT=0; shift ;;
         --update) UPDATE=1; shift ;;
         --run) RUN=1; shift ;;
@@ -78,7 +84,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --------------------------------------------------------------------- build
-KEEP=(); DROP=()
 do_build() {
     local extra=()
     for k in ${KEEP+"${KEEP[@]}"}; do extra+=(--keep "$k"); done
@@ -93,6 +98,18 @@ do_build() {
 # and no hardcoded list can cover every mod. So snapshot first, and afterwards
 # delete exactly what appeared. That keeps a test world from ever shipping.
 snapshot_tree() { ( cd "$OUT" && ls -A ) | sort > "$OUT/../.mcpack-pre-boot"; }
+
+# Mixin failures surface as "<Display Name> has class loading errors", with no
+# modId. The crash report's preceding "Mod File:" line names the jar, and the
+# jar names its modId.
+class_loading_failures() {
+    awk '/^[[:space:]]*Mod File: / { sub(/^[[:space:]]*Mod File: /, ""); jar = $0 }
+         /Failure message: .* has class loading errors/ && jar != "" { print jar; jar = "" }' \
+        "$OUT/boot.log" 2>/dev/null \
+    | sort -u | while IFS= read -r jar; do
+        [[ -f "$jar" ]] && python3 "$HERE/lib/packlib.py" --id "$jar"
+    done
+}
 
 # run.sh spawns java as a CHILD. Killing only the shell orphans the JVM: it
 # keeps the port, keeps running, and writes its test world back into the build
@@ -209,8 +226,10 @@ cmd_build() {
             (( skip )) && continue
             echo "    mod '$mid' failed during load -> dropping it"
             DROP+=("$mid"); DROP_REASON+=("crashed during load -- client-only"); progress=1
-        done < <(grep -oE 'Failed to create mod instance\. ModID: [A-Za-z0-9_-]+' "$OUT/boot.log" 2>/dev/null \
-                 | awk '{print $NF}' | sort -u)
+        # errexit reaches into this subshell: a grep that matches nothing must
+        # not end it before class_loading_failures runs.
+        done < <({ grep -oE 'Failed to create mod instance\. ModID: [A-Za-z0-9_-]+' "$OUT/boot.log" 2>/dev/null \
+                     | awk '{print $NF}' || true; class_loading_failures; } | sort -u)
         if (( ! progress )); then
             say "cannot proceed automatically"
             echo "The boot failed for a reason this script does not recognise."

@@ -21,6 +21,9 @@ gpu_tape
 immediatelyfast
 immersive_optimization
 oculus
+colorwheel
+iris_shader_folder
+iris_search
 puffish_biome_dither
 smoothchunk
 sodiumdynamiclights
@@ -73,3 +76,7 @@ lazyyyyy
 
 # --- proven crash-on-server (client class references in common setup)
 createenergycannons
+itemphysiclite
+itemphysicguns
+cubes_without_borders
+blur
