@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# mc-watch -- follow a server's log from your own machine, over ssh.
+#
+#   mc-watch <host> [instance] [--until-done] [-n LINES]
+#
+#   instance       defaults to whichever minecraft@ unit is active
+#   --until-done   exit 0 at "Done (...)!", exit 1 if the server crashes or stops
+#   -n LINES       history to show first                              [40]
+#
+# Unlike the other helpers this runs LOCALLY, not on the server. It reads
+# $MC_ROOT/<instance>/logs/latest.log, not the journal: the unit runs the
+# server inside screen, so its output never reaches journald.
+#
+# Read-only. Ctrl-C stops the watch, never the server -- unlike Ctrl-C inside
+# `mc-switch console`.
+#
+# Highlights: green = up, red = errors / crash / stop, yellow = WARN,
+# cyan = players joining and leaving.
+
+set -euo pipefail
+
+MC_ROOT="${MC_ROOT:-/opt/minecraft}"
+
+die() { echo "error: $*" >&2; exit 1; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \?//'; exit "${1:-0}"; }
+
+HOST=""; INST=""; UNTIL=0; LINES=40
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --until-done) UNTIL=1; shift ;;
+        -n) LINES="$2"; shift 2 ;;
+        -h|--help) usage 0 ;;
+        -*) die "unknown option $1" ;;
+        *) if [[ -z "$HOST" ]]; then HOST="$1"; elif [[ -z "$INST" ]]; then INST="$1"; else usage 1; fi; shift ;;
+    esac
+done
+[[ -n "$HOST" ]] || usage 1
+[[ -z "$INST" || "$INST" =~ ^[A-Za-z0-9._-]+$ ]] || die "instance must be a plain name"
+[[ "$LINES" =~ ^[0-9]+$ ]] || die "-n takes a number"
+
+COLOR=0; [[ -t 1 ]] && COLOR=1
+
+# Runs on the host. The filter runs there too, so sudo's password prompt
+# reaches the terminal directly instead of sitting in a local line buffer.
+read -r -d '' REMOTE <<'EOF' || true
+set -eu
+root=$1 inst=$2 until=$3 lines=$4 color=$5
+if [ -z "$inst" ]; then
+    inst=$(systemctl list-units 'minecraft@*' --state=active --plain --no-legend 2>/dev/null \
+           | awk 'NR==1 { sub(/^minecraft@/, "", $1); sub(/\.service$/, "", $1); print $1 }')
+    [ -n "$inst" ] || { echo "no minecraft@ instance is active; name one" >&2; exit 2; }
+fi
+log=$root/$inst/logs/latest.log
+echo "watching $inst ($(systemctl is-active "minecraft@$inst" 2>/dev/null || true)): $log"
+# Readable without sudo when the user is in the server's group. Before the
+# first boot there is no log yet, so judge by the instance directory.
+if [ -r "$log" ] || { [ ! -e "$log" ] && [ -r "$root/$inst" ] && [ -x "$root/$inst" ]; }; then
+    sudo=""
+else
+    sudo="sudo"
+fi
+# tail runs apart from the filter so that --until-done can end it: in a plain
+# pipe, sh would wait on tail until the server happened to log another line.
+fifo=$(mktemp -u); mkfifo "$fifo"
+# tail may already be gone (sudo refused); under set -e a failed kill would
+# skip the rm.
+trap 'kill "$tp" 2>/dev/null || true; rm -f "$fifo"' EXIT
+# tail -F waits for a log that does not exist yet (first boot) and follows
+# the new file when a restart rotates latest.log away.
+$sudo tail -n "$lines" -F "$log" >"$fifo" 2>&1 &
+tp=$!
+rc=0
+awk -v until="$until" -v color="$color" '
+    function paint(c, s) { return color ? "\033[" c "m" s "\033[0m" : s }
+    /Done \([0-9.]+s\)!/                                   { print paint("1;32", $0); fflush(); if (until) { rc = 0; exit }; next }
+    /Crash report saved|Stopping server|Encountered an unexpected exception/ \
+                                                           { print paint("1;31", $0); fflush(); if (until) { rc = 1; exit }; next }
+    /\/(ERROR|FATAL)\]|\[(ERROR|FATAL)\]/                  { print paint("31", $0); fflush(); next }
+    /\/WARN\]|\[WARN\]/                                    { print paint("33", $0); fflush(); next }
+    /joined the game|left the game|logged in with entity id|lost connection/ \
+                                                           { print paint("36", $0); fflush(); next }
+                                                           { print; fflush() }
+    # The log ended (tail died) before either verdict: not a success.
+    END { if (rc != "") exit rc; if (until) exit 1 }
+' <"$fifo" || rc=$?
+exit "$rc"
+EOF
+
+exec ssh -t "$HOST" "sh -c $(printf '%q' "$REMOTE") mc-watch $(printf '%q ' "$MC_ROOT" "$INST" "$UNTIL" "$LINES" "$COLOR")"

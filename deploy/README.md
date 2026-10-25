@@ -98,3 +98,12 @@ mc-switch stop                 # stop everything, disable autostart
 mc-switch console <instance>   # attach to its screen session
 mc-archive <instance>          # snapshot to $MC_ROOT/backups/
 ```
+
+`mc-watch` runs on **your** machine and follows a server's log over ssh. It
+reads `latest.log`, since the server's output goes to screen, not journald.
+Ctrl-C stops the watch, never the server.
+
+```
+mc-watch <host>                           # the active instance, live
+mc-watch <host> <instance> --until-done   # exit 0 at "Done", 1 on crash/stop
+```
