@@ -211,6 +211,30 @@ def analyze(path):
     return r
 
 
+def primary_id(path):
+    """The jar's own first modId -- the mod Forge means when it blames this
+    jar. analyze() folds nested jars' ids into a sorted `provides`, which
+    loses which one is the jar itself."""
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return None
+    with z:
+        for name in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
+            text = _read(z, name)
+            if text:
+                for m in _toml(text).get("mods") or []:
+                    if isinstance(m, dict) and m.get("modId"):
+                        return str(m["modId"]).lower()
+        fabric = _read(z, "fabric.mod.json")
+        if fabric:
+            try:
+                return str(json.loads(fabric)["id"]).lower()
+            except Exception:
+                pass
+    return None
+
+
 def index(mod_dir):
     return [analyze(p) for p in sorted(Path(mod_dir).glob("*.jar"))]
 
@@ -231,4 +255,7 @@ def unmet(records):
 
 
 if __name__ == "__main__":
-    print(json.dumps(index(sys.argv[1]), indent=2))
+    if len(sys.argv) == 3 and sys.argv[1] == "--id":
+        print(primary_id(sys.argv[2]) or "")
+    else:
+        print(json.dumps(index(sys.argv[1]), indent=2))

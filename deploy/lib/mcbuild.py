@@ -14,7 +14,7 @@ Loaders understood: Forge, NeoForge, Fabric. The server runtime is installed
 from the loader's own maven/meta endpoint, so no pre-existing build is needed.
 """
 
-import argparse, json, os, re, shutil, subprocess, sys, urllib.request, zipfile
+import argparse, json, os, re, shutil, subprocess, sys, tempfile, urllib.request, zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -394,6 +394,9 @@ def load_kb():
     return ids
 
 
+FORCED_DROP = "forced by --drop"
+
+
 def classify(recs, kb, force_keep, force_drop):
     keep, client, broken, advice = [], [], [], []
     for r in recs:
@@ -403,7 +406,7 @@ def classify(recs, kb, force_keep, force_drop):
         if r["loader"] == "neoforge-only" or (r["loader"] is None and not ids):
             broken.append((r, "; ".join(r["problems"]) or "no loadable metadata")); continue
         if ids & force_drop:
-            client.append((r, "forced by --drop")); continue
+            client.append((r, FORCED_DROP)); continue
         if ids & kb:
             client.append((r, "known client-only")); continue
         if (r["data"] == 0 and r["mixin_common"] == 0 and r["mixin_server"] == 0
@@ -414,7 +417,7 @@ def classify(recs, kb, force_keep, force_drop):
 
 
 def resolve_deps(keep, client, broken):
-    moved, unloadable = [], []
+    moved, unloadable, cascaded = [], [], []
     for _ in range(20):
         have = set(packlib.IMPLICIT)
         for r in keep:
@@ -431,7 +434,16 @@ def resolve_deps(keep, client, broken):
         progress = False
         for mid, requesters in missing.items():
             prov = next((c for c in client if mid in c[0]["provides"]), None)
-            if prov:
+            if prov and prov[1] == FORCED_DROP:
+                # --drop (or the boot test) has proven it cannot run here, so
+                # restoring it would only repeat the crash. Whatever hard-
+                # requires it cannot load without it: drop those too.
+                for r in requesters:
+                    if r in keep:
+                        keep.remove(r)
+                        client.append((r, f"requires '{mid}', which was dropped"))
+                        cascaded.append((r["file"], mid)); progress = True
+            elif prov:
                 client.remove(prov); keep.append(prov[0])
                 moved.append((prov[0]["file"], mid)); progress = True
             else:
@@ -442,7 +454,7 @@ def resolve_deps(keep, client, broken):
                         unloadable.append((r["file"], mid)); progress = True
         if not progress:
             break
-    return moved, unloadable
+    return moved, unloadable, cascaded
 
 
 def copy_content(src: Path, dst: Path):
@@ -499,13 +511,17 @@ def main():
     recs = packlib.index(src / "mods")
     keep, client, broken, advice = classify(
         recs, load_kb(), {x.lower() for x in a.keep}, {x.lower() for x in a.drop})
-    moved, unloadable = resolve_deps(keep, client, broken)
+    moved, unloadable, cascaded = resolve_deps(keep, client, broken)
     log(f"jars   : {len(recs)} -> keep {len(keep)}, client-only {len(client)}, unloadable {len(broken)}")
 
     if moved:
         print("\n  restored from the client-only pile (a kept mod hard-requires them):")
         for f, m in moved:
             print(f"    + {f}   provides '{m}'")
+    if cascaded:
+        print("\n  dropped with a dropped mod (they hard-require it):")
+        for f, m in cascaded:
+            print(f"    - {f}   requires '{m}'")
     if broken:
         print("\n  NOT DEPLOYED -- cannot load:")
         for r, why in broken:
@@ -515,6 +531,17 @@ def main():
         print("\n  STILL UNMET (the server will abort at load):")
         for f, m in unmet:
             print(f"    ! {m}  <- {f}")
+
+    # --runtime-from <out> means "reuse this build's own runtime", but the
+    # rmtree below would delete it before install_runtime could copy it.
+    stash = None
+    if a.runtime_from and out.exists() and \
+            Path(a.runtime_from).expanduser().resolve() == out.resolve():
+        stash = Path(tempfile.mkdtemp(prefix="mcpack-runtime-", dir=out.parent))
+        for f in ("libraries", "run.sh", "user_jvm_args.txt"):
+            if (out / f).exists():
+                shutil.move(str(out / f), str(stash / f))
+        a.runtime_from = str(stash)
 
     if out.exists():
         shutil.rmtree(out)
@@ -535,6 +562,8 @@ def main():
 
     if not a.no_runtime:
         install_runtime(out, mc, loader, lver, a.runtime_from)
+        if stash:
+            shutil.rmtree(stash, ignore_errors=True)
         # the installer writes its own user_jvm_args.txt; ours wins
         (out / "user_jvm_args.txt").write_text(
             f"-Xmx{a.heap}\n-Xms{a.heap}\n-XX:+UseG1GC\n-XX:MaxGCPauseMillis=100\n"
